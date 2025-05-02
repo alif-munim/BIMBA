@@ -23,6 +23,8 @@ from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.utils import rank0_print
 
+offload_dir = "/tmp/offload"
+os.makedirs(offload_dir, exist_ok=True)
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, 
             device_map="auto", torch_dtype="float16",attn_implementation="flash_attention_2", 
@@ -61,26 +63,26 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             )
         if "lora" in model_name.lower() and model_base is not None:
             lora_cfg_pretrained = AutoConfig.from_pretrained(model_path)
-            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False, local_files_only=True)
             rank0_print("Loading LLaVA from base model...")
             if "mixtral" in model_name.lower():
                 from llava.model.language_model.llava_mixtral import LlavaMixtralConfig
 
                 lora_cfg_pretrained = LlavaMixtralConfig.from_pretrained(model_path)
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-                model = LlavaMixtralForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False, local_files_only=True)
+                model = LlavaMixtralForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, local_files_only=True, offload_folder=offload_dir, **kwargs)
             elif "mistral" in model_name.lower():
                 from llava.model.language_model.llava_mistral import LlavaMistralConfig
 
                 lora_cfg_pretrained = LlavaMistralConfig.from_pretrained(model_path)
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-                model = LlavaMistralForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False, local_files_only=True)
+                model = LlavaMistralForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, local_files_only=True, offload_folder=offload_dir, **kwargs)
             elif "gemma" in model_name.lower():
                 from llava.model.language_model.llava_gemma import LlavaGemmaConfig
 
                 lora_cfg_pretrained = LlavaGemmaConfig.from_pretrained(model_path)
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-                model = LlavaGemmaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False, local_files_only=True)
+                model = LlavaGemmaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, offload_folder=offload_dir, **kwargs)
             
             elif "qwen" in model_name.lower() or "quyen" in model_name.lower():
                 rank0_print("Loading Qwen model")
@@ -92,9 +94,9 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                         rank0_print(f"Overwriting config with {overwrite_config}")
                         for k, v in overwrite_config.items():
                             setattr(llava_cfg, k, v)
-                        model = LlavaQwenMoeForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=llava_cfg, **kwargs)
+                        model = LlavaQwenMoeForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=llava_cfg, local_files_only=True, offload_folder=offload_dir, **kwargs)
                     else:
-                        model = LlavaQwenMoeForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, attn_implementation=attn_implementation, **kwargs)
+                        model = LlavaQwenMoeForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, attn_implementation=attn_implementation, local_files_only=True, offload_folder=offload_dir,**kwargs)
 
                 else:
                     from llava.model.language_model.llava_qwen import LlavaQwenConfig
@@ -106,7 +108,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     saved_config = LlavaQwenConfig.from_pretrained(model_path)
                     if hasattr(saved_config, "compressor_type"):
                         llava_cfg.compressor_type = saved_config.compressor_type
-                    model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=llava_cfg, **kwargs)
+                    model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=llava_cfg, local_files_only=True, offload_folder=offload_dir, **kwargs)
                     
                     # from llava.model.language_model.llava_qwen import LlavaQwenConfig
                     # if overwrite_config is not None:
@@ -126,8 +128,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 from llava.model.language_model.llava_llama import LlavaConfig
 
                 lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False, local_files_only=True)
+                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, local_files_only=True, offload_folder=offload_dir, **kwargs)
 
             token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
             if model.lm_head.weight.shape[0] != token_num:
@@ -155,9 +157,53 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             model.load_state_dict(non_lora_trainables, strict=False)
 
             from peft import PeftModel
+            # from safetensors.torch import load_file as safe_load_file
+            
+            # offload_dir = "/tmp/offload"
+            # os.makedirs(offload_dir, exist_ok=True)
+            
+            # try:
+            #     model = PeftModel.from_pretrained(
+            #         model,
+            #         model_path,
+            #         is_trainable=False,
+            #         offload_dir=offload_dir,
+            #         torch_dtype=torch.bfloat16,
+            #         use_safetensors=True
+            #     )
+            # except Exception as e:
+            #     rank0_print(f"PEFT load failed, fallback to safetensors.load_file: {e}")
+            #     adapter_path = os.path.join(model_path, "adapter_model.safetensors")
+            #     if not os.path.exists(adapter_path):
+            #         raise FileNotFoundError(f"{adapter_path} not found")
+            #     from safetensors.torch import load_file as safe_load_file
+            #     adapter_weights = safe_load_file(adapter_path, device="cpu")
+            #     model.load_state_dict(adapter_weights, strict=False)
+            
+            # if lora_alpha is not None:
+            #     rank0_print("Changing lora_alpha to", lora_alpha)
+            #     for name, module in model.named_modules():
+            #         if hasattr(module, "lora_alpha"):
+            #             module.lora_alpha = lora_alpha
+            
+            # if "peft" in str(type(model)).lower():
+            #     rank0_print("Merging LoRA weights...")
+            #     model = model.merge_and_unload()
 
             rank0_print("Loading LoRA weights...")
-            model = PeftModel.from_pretrained(model, model_path)
+            
+            kwargs["offload_folder"] = offload_dir
+            # kwargs["torch_dtype"] = torch.bfloat16  # already set earlier, do NOT override again here
+            
+            model = PeftModel.from_pretrained(
+                model,
+                model_path,
+                offload_dir=offload_dir,
+                is_trainable=False,
+                **kwargs
+            )
+
+
 
             if lora_alpha is not None:
                 rank0_print("Changing lora_alpha to", lora_alpha)
@@ -169,20 +215,21 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             model = model.merge_and_unload()
             rank0_print("Model is loaded...")
 
+
         elif model_base is not None:  # this may be mm projector only, loading projector with preset language mdoel
             rank0_print(f"Loading LLaVA from base model {model_base}...")
             if "mixtral" in model_name.lower():
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False, local_files_only=True)
                 cfg_pretrained = AutoConfig.from_pretrained(model_path)
-                model = LlavaMixtralForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
+                model = LlavaMixtralForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, attn_implementation=attn_implementation, local_files_only=True, offload_folder=offload_dir, **kwargs)
             elif "mistral" in model_name.lower() or "zephyr" in model_name.lower():
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False, local_files_only=True)
                 cfg_pretrained = AutoConfig.from_pretrained(model_path)
-                model = LlavaMistralForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
+                model = LlavaMistralForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, attn_implementation=attn_implementation, local_files_only=True, offload_folder=offload_dir, **kwargs)
             elif "gemma" in model_name.lower():
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False, local_files_only=True)
                 cfg_pretrained = AutoConfig.from_pretrained(model_path)
-                model = LlavaGemmaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
+                model = LlavaGemmaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, attn_implementation=attn_implementation, local_files_only=True, offload_folder=offload_dir, **kwargs)
             elif (
                 "wizardlm-2" in model_name.lower()
                 and "vicuna" in model_name.lower()
@@ -202,9 +249,9 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 else:
                     llava_cfg = customized_config
 
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False, local_files_only=True)
                 llava_cfg = LlavaConfig.from_pretrained(model_path)
-                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=llava_cfg, **kwargs)
+                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=llava_cfg, local_files_only=True, offload_folder=offload_dir, **kwargs)
             else:
                 raise ValueError(f"Model {model_name} not supported")
 
@@ -282,7 +329,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     saved_config = LlavaQwenConfig.from_pretrained(model_path)
                     if hasattr(saved_config, "compressor_type"):
                         llava_cfg.compressor_type = saved_config.compressor_type
-                    model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=llava_cfg, **kwargs)
+                    model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=llava_cfg, local_files_only=True, offload_folder=offload_dir, **kwargs)
 
                     # from llava.model.language_model.llava_qwen import LlavaQwenConfig
                     # if overwrite_config is not None:
@@ -324,8 +371,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             # PEFT model
             from peft import PeftModel
 
-            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-            model = AutoModelForCausalLM.from_pretrained(model_base, torch_dtype=torch.float16, low_cpu_mem_usage=True, device_map="auto")
+            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False, local_files_only=True)
+            model = AutoModelForCausalLM.from_pretrained(model_base, torch_dtype=torch.float16, low_cpu_mem_usage=True, device_map="auto", local_files_only=True)
             print(f"Loading LoRA weights from {model_path}")
             model = PeftModel.from_pretrained(model, model_path)
             print(f"Merging weights")
@@ -353,12 +400,29 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
         model.resize_token_embeddings(len(tokenizer))
 
+        # vision_tower = model.get_vision_tower()
+        # if not vision_tower.is_loaded:
+        #     vision_tower.load_model(device_map=device_map)
+        # if device_map != "auto":
+        #     vision_tower.to(device="cuda", dtype=torch.float16)
+
         vision_tower = model.get_vision_tower()
-        if not vision_tower.is_loaded:
-            vision_tower.load_model(device_map=device_map)
-        if device_map != "auto":
-            vision_tower.to(device="cuda", dtype=torch.float16)
+
+        from torch.nn import Parameter
+        
+        def materialize_meta_params(module):
+            for name, param in module.named_parameters(recurse=False):
+                if param.device.type == "meta":
+                    rank0_print(f"[WARNING] Param {name} is still on meta. Materializing on CUDA with dtype {param.dtype}")
+                    new_param = Parameter(torch.empty(param.shape, device="cuda", dtype=param.dtype))
+                    setattr(module, name, new_param)
+            for child in module.children():
+                materialize_meta_params(child)
+        
+        materialize_meta_params(vision_tower)
+        
         image_processor = vision_tower.image_processor
+
 
     if hasattr(model.config, "max_sequence_length"):
         context_len = model.config.max_sequence_length

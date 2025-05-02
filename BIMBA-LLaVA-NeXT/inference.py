@@ -10,6 +10,9 @@ import sys
 import warnings
 from decord import VideoReader, cpu
 import numpy as np
+from pathlib import Path
+import json
+import os
 warnings.filterwarnings("ignore")
 
 def load_video(video_path, max_frames_num,fps=1,force_sample=False):
@@ -30,8 +33,18 @@ def load_video(video_path, max_frames_num,fps=1,force_sample=False):
     spare_frames = vr.get_batch(frame_idx).asnumpy()
     return spare_frames,frame_time,video_time
 
-model_path = "checkpoints/BIMBA-LLaVA-Qwen2-7B"
-model_base = "lmms-lab/LLaVA-Video-7B-Qwen2"
+# model_path = "checkpoints/BIMBA-LLaVA-Qwen2-7B"
+# model_path = str(Path(__file__).resolve().parent / "BIMBA/BIMBA-LLaVA-NeXT/checkpoints/BIMBA-LLaVA-Qwen2-7B")
+# model_path = str(Path(__file__).resolve().parent / "checkpoints/BIMBA-LLaVA-Qwen2-7B")
+
+repo_root = Path(__file__).resolve().parent
+model_path = str(repo_root / "checkpoints/BIMBA-LLaVA-Qwen2-7B")
+
+
+
+# model_base = "lmms-lab/LLaVA-Video-7B-Qwen2"
+# model_base = os.environ["MODEL_BASE"]
+model_base = os.path.abspath(os.environ["MODEL_BASE"])
 model_name = "llava_qwen_lora"
 
 
@@ -43,7 +56,7 @@ tokenizer, model, image_processor, max_length = load_pretrained_model(
                                                     model_name = model_name, 
                                                     torch_dtype="bfloat16", 
                                                     device_map=device_map,
-                                                    attn_implementation=None,
+                                                    attn_implementation=None
                                                 )
 
 model.eval()
@@ -62,6 +75,7 @@ conv.append_message(conv.roles[0], question)
 conv.append_message(conv.roles[1], None)
 prompt_question = conv.get_prompt()
 input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
+
 cont = model.generate(
     input_ids,
     images=video,
@@ -72,3 +86,7 @@ cont = model.generate(
 )
 text_outputs = tokenizer.batch_decode(cont, skip_special_tokens=True)[0].strip()
 print(text_outputs)
+
+# Save output to output.json
+with open("output.json", "w") as f:
+    json.dump({"output": text_outputs}, f)
