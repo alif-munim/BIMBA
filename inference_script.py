@@ -18,7 +18,7 @@ ROOT            = Path(__file__).parent.resolve()              # /opt/ml/code
 MODEL_DIR       = ROOT / "BIMBA-LLaVA-NeXT"                    # llava repo
 CKPT_DIR        = MODEL_DIR / "checkpoints" / "BIMBA-LLaVA-Qwen2-7B"
 BASE_MODEL_DIR  = ROOT / "base_models" / "LLaVA-Video-7B-Qwen2"
-LOCAL_VIDEO     = ROOT / "video.mp4"
+LOCAL_VIDEO     = MODEL_DIR / "video.mp4"
 OUTPUT_JSON     = MODEL_DIR / "output.json"
 S3_OUTPUT_KEY   = "bimba-output/output.json"
 

@@ -62,7 +62,8 @@ tokenizer, model, image_processor, max_length = load_pretrained_model(
 model.eval()
 
 
-video_path = "assets/example.mp4"
+# video_path = "assets/example.mp4"
+video_path = "video.mp4"
 max_frames_num = 64
 video,frame_time,video_time = load_video(video_path, max_frames_num, 1, force_sample=True)
 video = image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda().bfloat16()
