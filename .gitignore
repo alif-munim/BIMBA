@@ -1,3 +1,6 @@
 BIMBA-LLaVA-NeXT/checkpoints
 .ipynb_checkpoints/
 echo*.mp4
+*zip
+*csv
+*jsonl

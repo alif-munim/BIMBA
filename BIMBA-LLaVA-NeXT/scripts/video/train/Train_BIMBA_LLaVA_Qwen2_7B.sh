@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Set up the data folder
-IMAGE_FOLDER="XXX"
-VIDEO_FOLDER="XXX"
-DATA_YAML="XXX" # e.g exp.yaml, exp_small.yaml
+IMAGE_FOLDER="/tmp/empty_images"
+VIDEO_FOLDER="/tmp"
+DATA_YAML="/opt/ml/code/BIMBA-LLaVA-NeXT/scripts/video/train/exp.yaml" # e.g exp.yaml, exp_small.yaml
 
 ############### Prepare Envs #################
 # python3 -m pip install flash-attn --no-build-isolation
@@ -62,17 +62,17 @@ deepspeed --master_port 30000 \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --tf32 True \
-    --model_max_length 32768 \
+    --model_max_length 8192 \
     --gradient_checkpointing True \
     --dataloader_num_workers 2 \
     --lazy_preprocess True \
     --torch_compile True \
     --torch_compile_backend "inductor" \
     --dataloader_drop_last True \
-    --frames_upbound 64 \
+    --frames_upbound 16 \
     --mm_newline_position grid \
     --add_time_instruction True \
     --force_sample True \
     --mm_spatial_pool_stride 2 \
-    --report_to wandb
+    --report_to none
 exit 0;

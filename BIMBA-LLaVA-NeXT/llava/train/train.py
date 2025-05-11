@@ -25,6 +25,7 @@ from typing import Dict, Optional, Sequence, List
 from PIL import Image, ImageFile
 from packaging import version
 import numpy as np
+import uuid
 
 import time
 import random
@@ -46,6 +47,10 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
 from llava.utils import rank0_print, process_video_with_pyav, process_video_with_decord
+import boto3, tempfile, urllib.parse, os
+from filelock import FileLock 
+
+_s3_client = boto3.client("s3")
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -961,9 +966,9 @@ class LazySupervisedDataset(Dataset):
         self.tokenizer = tokenizer
         self.list_data_dict = []
 
-        rank0_print(f"yt_metadata: /mnt/meg/mmiemon/datasets/YTScam/YTscam_metadata_frames_32.json")
-        with open('/mnt/meg/mmiemon/datasets/YTScam/YTscam_metadata_frames_32.json', 'r') as f:
-            self.yt_metadata = json.load(f)
+        # rank0_print(f"yt_metadata: /mnt/meg/mmiemon/datasets/YTScam/YTscam_metadata_frames_32.json")
+        # with open('/mnt/meg/mmiemon/datasets/YTScam/YTscam_metadata_frames_32.json', 'r') as f:
+        #     self.yt_metadata = json.load(f)
         # if 'yt_scam' in data_path and '100f' in data_path:
         #     rank0_print(f"yt_metadata: /mnt/meg/mmiemon/datasets/YTScam/YTscam_metadata_frames_100.json")
         #     with open('/mnt/meg/mmiemon/datasets/YTScam/YTscam_metadata_frames_100.json', 'r') as f:
@@ -1152,7 +1157,34 @@ class LazySupervisedDataset(Dataset):
             sample = self._get_item(i)
             return sample
         except Exception as e:
-            raise e
+            raise 
+
+    from filelock import FileLock         #  pip install filelock  (put in requirements.txt)
+
+    def _fetch_s3(self, uri: str) -> str:
+        if not hasattr(self, "_s3_cache"):     # one cache per process
+            self._s3_cache = {}
+    
+        if uri in self._s3_cache:              # already downloaded
+            return self._s3_cache[uri]
+    
+        bucket, key = urllib.parse.urlparse(uri).netloc, urllib.parse.urlparse(uri).path.lstrip("/")
+        local_dir   = os.path.join(tempfile.gettempdir(), "bimba_s3_cache")
+        os.makedirs(local_dir, exist_ok=True)
+        local_path  = os.path.join(local_dir, os.path.basename(key))
+    
+        # ---- new: atomic download so only one worker writes the file ----
+        lock = FileLock(local_path + ".lock")
+        with lock:
+            if not os.path.exists(local_path):
+                tmp = local_path + "." + str(uuid.uuid4())      # unique tmp
+                _s3_client.download_file(bucket, key, tmp)
+                os.rename(tmp, local_path)                      # atomic move
+    
+        self._s3_cache[uri] = local_path
+        return local_path
+
+
 
     def _get_item(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
@@ -1175,7 +1207,9 @@ class LazySupervisedDataset(Dataset):
 
         elif "video" in sources[0]:
             video_file = self.list_data_dict[i]["video"]
-            if "video_folder" in self.list_data_dict[i]:
+            if video_file.startswith("s3://"):
+                video_file = self._fetch_s3(video_file)   # <<< new helper
+            elif "video_folder" in self.list_data_dict[i]:
                 video_file = os.path.join(self.list_data_dict[i]["video_folder"], video_file)
             else:
                 video_folder = self.data_args.video_folder
