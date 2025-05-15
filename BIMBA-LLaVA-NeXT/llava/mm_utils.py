@@ -8,6 +8,12 @@ import torch
 from transformers import StoppingCriteria
 from llava.constants import IMAGE_TOKEN_INDEX
 
+# --- at the very top of mm_utils.py --------------------------------
+try:
+    from .train_defaults import PATCHES_PER_FRAME   # optional helper
+except Exception:
+    PATCHES_PER_FRAME = 1          # fallback so import never breaks
+# --------------------------------------------------------------------
 
 def resize_and_center_crop(image, shortest_edge_length):
     # Calculate new dimensions and resize
@@ -338,25 +344,107 @@ def process_images(images, image_processor, model_cfg):
     return new_images
 
 
-def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
-    prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split("<image>")]
+# def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
+#     prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split("<image>")]
 
-    def insert_separator(X, sep):
-        return [ele for sublist in zip(X, [sep] * len(X)) for ele in sublist][:-1]
+#     def insert_separator(X, sep):
+#         return [ele for sublist in zip(X, [sep] * len(X)) for ele in sublist][:-1]
 
-    input_ids = []
-    offset = 0
-    if len(prompt_chunks) > 0 and len(prompt_chunks[0]) > 0 and prompt_chunks[0][0] == tokenizer.bos_token_id:
-        offset = 1
-        input_ids.append(prompt_chunks[0][0])
+#     input_ids = []
+#     offset = 0
+#     if len(prompt_chunks) > 0 and len(prompt_chunks[0]) > 0 and prompt_chunks[0][0] == tokenizer.bos_token_id:
+#         offset = 1
+#         input_ids.append(prompt_chunks[0][0])
 
-    for x in insert_separator(prompt_chunks, [image_token_index] * (offset + 1)):
-        input_ids.extend(x[offset:])
+#     for x in insert_separator(prompt_chunks, [image_token_index] * (offset + 1)):
+#         input_ids.extend(x[offset:])
 
+#     if return_tensors is not None:
+#         if return_tensors == "pt":
+#             return torch.tensor(input_ids, dtype=torch.long)
+#         raise ValueError(f"Unsupported tensor type: {return_tensors}")
+#     return input_ids
+
+import torch
+
+def tokenizer_image_token(
+    prompt: str,
+    tokenizer,
+    *,
+    image_token_index: int = IMAGE_TOKEN_INDEX,
+    view_sep_token: str = "<VIEW_SEP>",
+    patches_per_frame: int = PATCHES_PER_FRAME,
+    return_tensors: str | None = None,
+):
+    """
+    Replace each <image> in *prompt* with PATCHES_PER_FRAME copies of
+    `image_token_index`.  When there is more than one image/clip, insert a
+    single <VIEW_SEP> token *between* consecutive clips.
+
+    Parameters
+    ----------
+    prompt : str
+        The raw prompt that still contains textual '<image>' placeholders.
+    tokenizer : transformers.PreTrainedTokenizer
+    image_token_index : int
+        ID that represents *one* vision patch.
+    view_sep_token : str
+        Special token that demarcates clip boundaries.
+    patches_per_frame : int
+        How many patch-tokens a single clip occupies.
+    return_tensors : {"pt", None}
+        If "pt", return a `torch.LongTensor`; otherwise return `list[int]`.
+
+    Returns
+    -------
+    list[int] | torch.LongTensor
+    """
+    # ------------------------------------------------------------------ #
+    # 1. split the prompt into   text  <image>  text  <image>  …  text   #
+    # ------------------------------------------------------------------ #
+    text_chunks: list[str] = prompt.split("<image>")
+    n_clips: int = len(text_chunks) - 1                 # number of <image>s
+
+    # Tokenise each text chunk up‐front
+    chunk_ids: list[list[int]] = [tokenizer(chunk).input_ids
+                                  for chunk in text_chunks]
+
+    view_sep_id: int = tokenizer.convert_tokens_to_ids(view_sep_token)
+
+    # ------------------------------------------------------------- #
+    # 2. helper that produces   [patch … patch, (view_sep)]         #
+    # ------------------------------------------------------------- #
+    def clip_block(idx: int) -> list[int]:
+        ids = [image_token_index] * patches_per_frame
+        if idx < n_clips - 1:           # not after the last clip
+            ids.append(view_sep_id)
+        return ids
+
+    # ------------------------------------------------------------- #
+    # 3. stitch them back together into a single token sequence     #
+    # ------------------------------------------------------------- #
+    input_ids: list[int] = []
+
+    # keep a leading <bos> only once
+    offset = 1 if chunk_ids and chunk_ids[0] and \
+                 chunk_ids[0][0] == tokenizer.bos_token_id else 0
+    if offset:
+        input_ids.append(chunk_ids[0][0])
+
+    for idx, txt_ids in enumerate(chunk_ids):
+        input_ids.extend(txt_ids[offset:])   # the text part
+        offset = 0                           # only skip bos for the 1st chunk
+        if idx < n_clips:                    # after every text but the last
+            input_ids.extend(clip_block(idx))
+
+    # ------------------------------------------------------------- #
+    # 4. optional tensor output                                     #
+    # ------------------------------------------------------------- #
     if return_tensors is not None:
         if return_tensors == "pt":
             return torch.tensor(input_ids, dtype=torch.long)
-        raise ValueError(f"Unsupported tensor type: {return_tensors}")
+        raise ValueError(f"Unsupported tensor type: {return_tensors!r}")
+
     return input_ids
 
 

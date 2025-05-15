@@ -62,14 +62,14 @@ deepspeed --master_port 30000 \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --tf32 True \
-    --model_max_length 8192 \
+    --model_max_length 32768 \
     --gradient_checkpointing True \
     --dataloader_num_workers 2 \
     --lazy_preprocess True \
     --torch_compile True \
     --torch_compile_backend "inductor" \
     --dataloader_drop_last True \
-    --frames_upbound 16 \
+    --frames_upbound 64 \
     --mm_newline_position grid \
     --add_time_instruction True \
     --force_sample True \

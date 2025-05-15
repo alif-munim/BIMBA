@@ -49,6 +49,7 @@ from llava.mm_utils import process_highres_image, process_anyres_image, process_
 from llava.utils import rank0_print, process_video_with_pyav, process_video_with_decord
 import boto3, tempfile, urllib.parse, os
 from filelock import FileLock 
+import itertools 
 
 _s3_client = boto3.client("s3")
 
@@ -58,6 +59,54 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 local_rank = None
 
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse("0.14")
+
+# ── globals filled in later ─────────────────────────────────────────
+view_sep_id        = None   # will hold tokenizer ID for <VIEW_SEP>
+image_patch_id     = IMAGE_TOKEN_INDEX      # already known
+PATCHES_PER_FRAME  = None   # will be set after vision tower is built
+# ────────────────────────────────────────────────────────────────────
+
+
+# >>> DEBUG helper -------------------------------------------------------------
+def _dbg(obj, name="", rank_only=True):
+    """
+    Light-weight pretty-printer that only prints on rank-0 unless rank_only=False
+    """
+    if not rank_only or (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+        print(f"[DEBUG] {name}: {obj}")
+# <<< --------------------------------------------------------------------------
+
+
+class EchoTrainer(LLaVATrainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits  = outputs.logits
+
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
+        loss     = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+        # use *this* trainer’s tokenizer, not a global
+        meta_s_id = self.tokenizer.convert_tokens_to_ids("<META_START>")
+        meta_e_id = self.tokenizer.convert_tokens_to_ids("<META_END>")
+
+        bs, seq = labels.size()
+        meta_start = (labels == meta_s_id).nonzero()
+        meta_end   = (labels == meta_e_id).nonzero()
+
+        weight = torch.ones_like(loss)
+        for b in range(bs):
+            try:
+                s = meta_start[meta_start[:, 0] == b][:, 1].min()
+                e = meta_end  [meta_end  [:, 0] == b][:, 1].max()
+                weight[b * seq + s : b * seq + e + 1] = 1.3
+            except ValueError:
+                # sample is missing META tags – just skip boost
+                pass
+
+        loss = (loss * weight).sum() / weight.ne(0).sum()
+        return (loss, outputs) if return_outputs else loss
+
 
 
 @dataclass
@@ -352,15 +401,24 @@ def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedToken
     )
 
 
+# def _mask_targets(target, tokenized_lens, speakers):
+#     # cur_idx = 0
+#     cur_idx = tokenized_lens[0]
+#     tokenized_lens = tokenized_lens[1:]
+#     target[:cur_idx] = IGNORE_INDEX
+#     for tokenized_len, speaker in zip(tokenized_lens, speakers):
+#         if speaker == "human":
+#             target[cur_idx + 2 : cur_idx + tokenized_len] = IGNORE_INDEX
+#         cur_idx += tokenized_len
+
 def _mask_targets(target, tokenized_lens, speakers):
-    # cur_idx = 0
-    cur_idx = tokenized_lens[0]
-    tokenized_lens = tokenized_lens[1:]
+    cur_idx = tokenized_lens[0]         # keep system header masked
     target[:cur_idx] = IGNORE_INDEX
-    for tokenized_len, speaker in zip(tokenized_lens, speakers):
+    for tok_len, speaker in zip(tokenized_lens[1:], speakers):
         if speaker == "human":
-            target[cur_idx + 2 : cur_idx + tokenized_len] = IGNORE_INDEX
-        cur_idx += tokenized_len
+            target[cur_idx : cur_idx + tok_len] = IGNORE_INDEX
+        cur_idx += tok_len
+
 
 
 def _add_speaker_and_signal(header, source, get_conversation=True):
@@ -576,8 +634,14 @@ def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
     if has_image:
         tokenizer.add_tokens(["<image>"], special_tokens=True)
 
-    image_token_index = tokenizer.convert_tokens_to_ids("<image>")
-    im_start, im_end = tokenizer.additional_special_tokens_ids
+    # image_token_index = tokenizer.convert_tokens_to_ids("<image>")
+    global IMAGE_TOKEN_INDEX
+    IMAGE_TOKEN_INDEX = tokenizer.convert_tokens_to_ids("<image>")
+    image_token_index = IMAGE_TOKEN_INDEX
+    
+    # im_start, im_end = tokenizer.additional_special_tokens_ids
+    im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    im_end   = tokenizer.convert_tokens_to_ids("<|im_end|>")
     # unmask_tokens = ["<|im_start|>", "<|im_start|>", "\n"]
     unmask_tokens_idx =  [198, im_start, im_end]
     nl_tokens = tokenizer("\n").input_ids
@@ -657,7 +721,9 @@ def preprocess_llama3(
     # When there is actually an image, we add the image tokens as a special token
     if has_image:
         tokenizer.add_tokens(["<image>"], special_tokens=True)
-    image_token_index = tokenizer.convert_tokens_to_ids("<image>")
+    # image_token_index = tokenizer.convert_tokens_to_ids("<image>")
+    image_token_index = IMAGE_TOKEN_INDEX        # instead of tokenizer.convert…
+
     bos_token_id = tokenizer.convert_tokens_to_ids("<|begin_of_text|>")
     start_header_id = tokenizer.convert_tokens_to_ids("<|start_header_id|>")
     end_header_id = tokenizer.convert_tokens_to_ids("<|end_header_id|>")
@@ -1057,6 +1123,18 @@ class LazySupervisedDataset(Dataset):
                 rank0_print(f"Loaded {len(cur_data_dict)} samples from {data_path}")
                 self.list_data_dict.extend(cur_data_dict)
 
+
+        # >>> DEBUG ------------------------------------------------------------
+        _dbg(data_args.dataset_paths, "dataset_paths")
+        _dbg(len(self.list_data_dict), "num_loaded_samples")
+        if len(self.list_data_dict) == 0:
+            raise RuntimeError(
+                "No training samples were loaded. "
+                "Check that every json/jsonl path in exp.yaml is valid & non-empty."
+            )
+        # <<< ------------------------------------------------------------------
+
+        
         rank0_print(f"Loaded {len(self.list_data_dict)} samples from {data_path}")
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
@@ -1127,6 +1205,11 @@ class LazySupervisedDataset(Dataset):
         return image, image_size, "image"
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        # >>> DEBUG: peek at first sample once ---------------------------------
+        if i == 0 and os.environ.get("ECHO_DEBUG", "0") == "1":
+            _dbg(self.list_data_dict[0], "first_raw_record", rank_only=False)
+        # <<< ------------------------------------------------------------------
+
         # TODO: define number of retries somewhere else
         num_base_retries = 3
         num_final_retries = 300
@@ -1159,9 +1242,25 @@ class LazySupervisedDataset(Dataset):
         except Exception as e:
             raise 
 
-    from filelock import FileLock         #  pip install filelock  (put in requirements.txt)
 
     def _fetch_s3(self, uri: str) -> str:
+
+        # ---- 1⃣  sanitise double-scheme typos -------------------------------
+        while uri.startswith("s3://s3://"):
+            uri = uri.replace("s3://s3://", "s3://", 1)
+    
+        parsed = urllib.parse.urlparse(uri)
+        bucket, key = parsed.netloc, parsed.path.lstrip("/")
+    
+        # ---- 2⃣  salvage "//bucket/key" cases (empty netloc) ----------------
+        if not bucket and key.count("/") > 0 and key.startswith("/"):
+            # uri looked like   s3:////bucket/key   or   s3:///bucket/key
+            bucket, key = key.lstrip("/").split("/", 1)
+    
+        # ---- 3⃣  final sanity-check -----------------------------------------
+        if not bucket or bucket.endswith(":"):
+            raise ValueError(f"Bad S3 URI: {uri}")
+        
         if not hasattr(self, "_s3_cache"):     # one cache per process
             self._s3_cache = {}
     
@@ -1204,6 +1303,51 @@ class LazySupervisedDataset(Dataset):
             else:
                 image = [self.process_image(image_file)]
             sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
+        elif "salient_videos" in sources[0]:
+            video_files = self.list_data_dict[i]["salient_videos"]   # list of s3:// URIs
+            images = []
+            if isinstance(video_files, str):           # tolerate bad field
+                video_files = ast.literal_eval(video_files)
+
+            for uri in video_files:
+                local_path = self._fetch_s3(uri)
+                # clip, vt, ft, _ = process_video_with_decord(local_path, self.data_args)
+                result = process_video_with_decord(local_path, self.data_args)
+                if len(result) == 3:                      # BIMBA returns 3 items
+                    clip, vt, ft = result
+                else:                                     # older LLaVA returns 4
+                    clip, vt, ft, _ = result
+                images.append(
+                    (
+                        self.data_args.image_processor.preprocess(
+                            clip, return_tensors="pt"
+                        )["pixel_values"],
+                        clip[0].shape[-2:],
+                        "video",
+                    )
+                )
+                # images.append( (self.data_args.image_processor.preprocess(clip, return_tensors="pt")["pixel_values"],
+                #                 clip[0].shape[-2:], "video") )
+            image = images                                        # list of N clip tensors
+            # image is a list of tuples, one per clip
+            # We add a dummy entry whose "modality" we mark as "view_sep"
+            view_separators = [
+                (torch.zeros(1, 3, 1, 1), (1, 1), "view_sep")    # ↓  ignored by the vision tower
+                for _ in range(len(image) - 1)                   # one between every two clips
+            ]
+            
+            # interleave: clip₁, SEP, clip₂, SEP, …
+            interleaved = []
+            for clip, sep in itertools.zip_longest(image, view_separators):
+                interleaved.append(clip)
+                if sep is not None:
+                    interleaved.append(sep)
+            
+            image = interleaved
+
+            sources = preprocess_multimodal(
+                         copy.deepcopy([e["conversations"] for e in sources]),
+                         self.data_args)
 
         elif "video" in sources[0]:
             video_file = self.list_data_dict[i]["video"]
@@ -1294,7 +1438,13 @@ class LazySupervisedDataset(Dataset):
                         except IOError:
                             print(f"Failed to read frame at path: {frame_path}")
                 else:
-                    video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(video_file, self.data_args)
+                    # video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(video_file, self.data_args)
+                    result = process_video_with_decord(video_file, self.data_args)
+                    if len(result) == 3:
+                        video, video_time, frame_time = result
+                        num_frames_to_sample = None
+                    else:
+                        video, video_time, frame_time, num_frames_to_sample = result
 
                 # print(video.shape, np.sum(video))
                 # print(video_time, frame_time, num_frames_to_sample)
@@ -1316,7 +1466,8 @@ class LazySupervisedDataset(Dataset):
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
 
-        has_image = ("image" in self.list_data_dict[i]) or ("video" in self.list_data_dict[i])
+        # has_image = ("image" in self.list_data_dict[i]) or ("video" in self.list_data_dict[i])
+        has_image = any(k in self.list_data_dict[i] for k in ["image", "video", "salient_videos"])
         data_dict = preprocess(sources, self.tokenizer, has_image=has_image)
 
         if "prompt" in data_dict:
@@ -1379,6 +1530,15 @@ class DataCollatorForSupervisedDataset(object):
 
             batch["image_sizes"] = [im[1] for im_list in images for im in im_list]
             batch["modalities"] = [im[2] for im_list in images for im in im_list]
+
+            tokens  = []
+            for modality in batch["modalities"]:
+                if modality == "view_sep":
+                    tokens.append(view_sep_id)   # the new single-token block
+                else:
+                    tokens.extend([image_patch_id] * PATCHES_PER_FRAME)   # existing logic
+            # batch["vision_token_ids"] = tokens
+
             images = [im[0] for im_list in images for im in im_list]
 
             # if all(x is not None and x.shape == images[0].shape for x in images):
@@ -1670,6 +1830,167 @@ def train(attn_implementation=None):
             use_fast=False,
         )
 
+    # ------------------------------------------------------------------
+    # make sure the Qwen chat delimiters are registered before training
+    if "<|im_start|>" not in tokenizer.get_vocab() or "<|im_end|>" not in tokenizer.get_vocab():
+        smart_tokenizer_and_embedding_resize(
+            dict(additional_special_tokens=["<|im_start|>", "<|im_end|>"]),
+            tokenizer,
+            model,
+        )
+    # ------------------------------------------------------------------
+
+
+    meas_tag_map = {
+        "<N0>":  "<aortic_valve_peak_velocity>",
+        "<N1>":  "<aortic_valve_mean_gradient>",
+        "<N2>":  "<aortic_valve_effective_orifice_area>",
+        "<N3>":  "<aortic_valve_dimensionless_index>",
+        "<N4>":  "<left_ventricular_ejection_fraction>",
+        "<N5>":  "<left_ventricular_end_diastolic_volume_index>",
+        "<N6>":  "<left_ventricular_end_systolic_volume_index>",
+        "<N7>":  "<left_ventricular_mass_index>",
+        "<N8>":  "<left_ventricular_dpdt>",
+        "<N9>":  "<left_ventricular_outflow_tract_velocity_time_integral>",
+        "<N10>": "<left_ventricular_outflow_tract_peak_gradient>",
+        "<N11>": "<mitral_inflow_deceleration_time>",
+        "<N12>": "<mitral_e_a_ratio>",
+        "<N13>": "<mitral_e_e_prime_ratio>",
+        "<N14>": "<right_ventricular_systolic_pressure>",
+        "<N15>": "<right_ventricular_fractional_area_change>",
+        "<N16>": "<tricuspid_annular_plane_systolic_excursion>",
+        "<N17>": "<left_atrial_volume_index>",
+        "<N18>": "<aortic_root_diameter>",
+        "<N19>": "<ascending_aorta_diameter>",
+    }
+    
+    cond_tag_map = {
+        "<C0>":  "<aortic_root_ascending_aorta_size_mild>",
+        "<C1>":  "<aortic_root_ascending_aorta_size_moderate>",
+        "<C2>":  "<aortic_root_ascending_aorta_size_normal>",
+        "<C3>":  "<aortic_root_ascending_aorta_size_severe>",
+    
+        "<C4>":  "<aortic_regurgitation_mild>",
+        "<C5>":  "<aortic_regurgitation_moderate>",
+        "<C6>":  "<aortic_regurgitation_none>",
+        "<C7>":  "<aortic_regurgitation_severe>",
+        "<C8>":  "<aortic_regurgitation_trace>",
+    
+        "<C9>":  "<aortic_stenosis_mild>",
+        "<C10>": "<aortic_stenosis_moderate>",
+        "<C11>": "<aortic_stenosis_none>",
+        "<C12>": "<aortic_stenosis_severe>",
+    
+        "<C13>": "<diastolic_filling_pattern_fusion>",
+        "<C14>": "<diastolic_filling_pattern_grade_i>",
+        "<C15>": "<diastolic_filling_pattern_grade_ii>",
+        "<C16>": "<diastolic_filling_pattern_grade_iii_iv>",
+        "<C17>": "<diastolic_filling_pattern_normal>",
+    
+        "<C18>": "<ivc_respiratory_collapse_gt_50>",
+        "<C19>": "<ivc_respiratory_collapse_lt_50>",
+        "<C20>": "<ivc_respiratory_collapse_no_change>",
+    
+        "<C21>": "<left_atrial_size_mild>",
+        "<C22>": "<left_atrial_size_moderate>",
+        "<C23>": "<left_atrial_size_normal>",
+        "<C24>": "<left_atrial_size_severe>",
+    
+        "<C25>": "<left_ventricular_cavity_size_decreased>",
+        "<C26>": "<left_ventricular_cavity_size_mild>",
+        "<C27>": "<left_ventricular_cavity_size_moderate>",
+        "<C28>": "<left_ventricular_cavity_size_normal>",
+        "<C29>": "<left_ventricular_cavity_size_severe>",
+    
+        "<C30>": "<left_ventricular_hypertrophy_asymmetric>",
+        "<C31>": "<left_ventricular_hypertrophy_mild>",
+        "<C32>": "<left_ventricular_hypertrophy_moderate>",
+        "<C33>": "<left_ventricular_hypertrophy_none>",
+        "<C34>": "<left_ventricular_hypertrophy_severe>",
+    
+        "<C35>": "<left_ventricular_systolic_function_hyperdynamic>",
+        "<C36>": "<left_ventricular_systolic_function_low_normal>",
+        "<C37>": "<left_ventricular_systolic_function_mild_decrease>",
+        "<C38>": "<left_ventricular_systolic_function_moderate_decrease>",
+        "<C39>": "<left_ventricular_systolic_function_normal>",
+        "<C40>": "<left_ventricular_systolic_function_severe_decrease>",
+    
+        "<C41>": "<mitral_regurgitation_mild>",
+        "<C42>": "<mitral_regurgitation_moderate>",
+        "<C43>": "<mitral_regurgitation_none>",
+        "<C44>": "<mitral_regurgitation_severe>",
+        "<C45>": "<mitral_regurgitation_trace>",
+    
+        "<C46>": "<pulmonary_artery_pressure_mild>",
+        "<C47>": "<pulmonary_artery_pressure_moderate>",
+        "<C48>": "<pulmonary_artery_pressure_normal>",
+        "<C49>": "<pulmonary_artery_pressure_severe>",
+    
+        "<C50>": "<pericardial_effusion_large>",
+        "<C51>": "<pericardial_effusion_moderate>",
+        "<C52>": "<pericardial_effusion_none>",
+        "<C53>": "<pericardial_effusion_small>",
+        "<C54>": "<pericardial_effusion_trivial>",
+    
+        "<C55>": "<pulmonary_regurgitation_mild>",
+        "<C56>": "<pulmonary_regurgitation_moderate>",
+        "<C57>": "<pulmonary_regurgitation_none>",
+        "<C58>": "<pulmonary_regurgitation_severe>",
+        "<C59>": "<pulmonary_regurgitation_trace>",
+    
+        "<C60>": "<right_atrial_size_mild>",
+        "<C61>": "<right_atrial_size_moderate>",
+        "<C62>": "<right_atrial_size_normal>",
+        "<C63>": "<right_atrial_size_severe>",
+    
+        "<C64>": "<right_ventricular_systolic_function_low_normal>",
+        "<C65>": "<right_ventricular_systolic_function_mild_decrease>",
+        "<C66>": "<right_ventricular_systolic_function_moderate_decrease>",
+        "<C67>": "<right_ventricular_systolic_function_normal>",
+        "<C68>": "<right_ventricular_systolic_function_severe_decrease>",
+    
+        "<C69>": "<right_ventricular_cavity_size_mild>",
+        "<C70>": "<right_ventricular_cavity_size_moderate>",
+        "<C71>": "<right_ventricular_cavity_size_normal>",
+        "<C72>": "<right_ventricular_cavity_size_severe>",
+        "<C73>": "<right_ventricular_cavity_size_upper_normal>",
+    
+        "<C74>": "<tricuspid_regurgitation_mild>",
+        "<C75>": "<tricuspid_regurgitation_moderate>",
+        "<C76>": "<tricuspid_regurgitation_none>",
+        "<C77>": "<tricuspid_regurgitation_severe>",
+        "<C78>": "<tricuspid_regurgitation_trace>",
+    }
+    
+    # after tokenizer = transformers.AutoTokenizer.from_pretrained(…)
+    SPECIAL_TAGS = (
+        ["<META_START>", "<META_END>"]
+        + list(meas_tag_map.values())      # 19 numeric
+        + list(cond_tag_map.values())      # 74 categorical
+    )
+    
+    # add as *special* tokens so BPE never splits on underscores
+    smart_tokenizer_and_embedding_resize(
+            special_tokens_dict=dict(additional_special_tokens=SPECIAL_TAGS),
+            tokenizer=tokenizer,
+            model=model,
+    )
+    assert tokenizer.convert_tokens_to_ids("<left_ventricular_ejection_fraction>") != tokenizer.unk_token_id
+
+    # somewhere near the top-level constants
+    VIEW_SEP_TOKEN = "<VIEW_SEP>"
+    
+    # after you build/​load the tokenizer *before* you feed the first batch
+    if VIEW_SEP_TOKEN not in tokenizer.get_vocab():
+        smart_tokenizer_and_embedding_resize(
+            dict(additional_special_tokens=[VIEW_SEP_TOKEN]),
+            tokenizer,
+            model,                 # will .resize_token_embeddings()
+        )
+    global view_sep_id 
+    view_sep_id = tokenizer.convert_tokens_to_ids(VIEW_SEP_TOKEN)
+
+
     rank0_print(f"Prompt version: {model_args.version}")
     if model_args.version == "v0":
         if tokenizer.pad_token is None:
@@ -1692,6 +2013,16 @@ def train(attn_implementation=None):
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
 
         vision_tower = model.get_vision_tower()
+        global PATCHES_PER_FRAME, image_patch_id
+        
+        try:                         # ViT-style towers
+            PATCHES_PER_FRAME = vision_tower.num_patches + 1
+            import importlib, llava.mm_utils as mmu
+            mmu.PATCHES_PER_FRAME = PATCHES_PER_FRAME
+
+        except AttributeError:       # pooled towers
+            PATCHES_PER_FRAME = 1
+        image_patch_id = IMAGE_TOKEN_INDEX
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
         data_args.image_processor = vision_tower.image_processor
@@ -1866,6 +2197,23 @@ def train(attn_implementation=None):
                         module = module.to(torch.bfloat16)
     
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    # >>> DEBUG ------------------------------------------------------------
+    _dbg(len(data_module["train_dataset"]), "dataset_len")
+
+    # Pull one batch to make sure the collator works
+    tmp_loader = torch.utils.data.DataLoader(
+        data_module["train_dataset"],
+        batch_size=1,
+        shuffle=False,
+        collate_fn=data_module["data_collator"],
+        num_workers=0,
+    )
+    sample_batch = next(iter(tmp_loader))
+    _dbg(sample_batch.keys(), "batch_keys")
+    _dbg(sample_batch["input_ids"].shape, "input_ids.shape")
+    _dbg(tokenizer.decode(sample_batch["input_ids"][0][:200]), "first_200_tokens")
+    # <<< ------------------------------------------------------------------
+
 
     # print(len(data_module["train_dataset"]))
     # for i, x in enumerate(data_module["train_dataset"]):
@@ -1873,7 +2221,8 @@ def train(attn_implementation=None):
     #     video, video_time, num_frames_to_sample = x["image"][0]
     # exit(0)
 
-    trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    # trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    trainer = EchoTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
